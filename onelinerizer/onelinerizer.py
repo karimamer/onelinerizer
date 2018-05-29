@@ -10,12 +10,11 @@ $ python main.py infile.py outfile.py
     one-line infile.py, put the result in outfile.py
 """
 
-import argparse
 import ast
 import symtable
-import sys
 import traceback
-from template import T
+
+from .template import T
 
 
 def lambda_function(arguments_to_values):
@@ -76,13 +75,14 @@ def get_init_code(tree, table):
 
     output = provide(
         output.format(__l=T('{__g}')),
-        __print=T("__import__('__builtin__').__dict__['print']"),
+        __print=T("__import__('__builtin__', level=0).__dict__['print']"),
         __y="(lambda f: (lambda x: x(x))(lambda y:"
           " f(lambda: y(y)())))",
         __g=T("globals()"),
-        __contextlib="__import__('contextlib')",
-        __sys="__import__('sys')",
-        __types="__import__('types')")
+        __contextlib="__import__('contextlib', level=0)",
+        __operator="__import__('operator', level=0)",
+        __sys="__import__('sys', level=0)",
+        __types="__import__('types', level=0)")
 
     return output.close()
 
@@ -154,6 +154,7 @@ class Namespace(ast.NodeVisitor):
         self.subtables = iter(table.get_children())
         self.private = '_' + table.get_name() if table.get_type() == 'class' \
                        else private
+        self.futures = set()
 
     def next_child(self):
         return Namespace(next(self.subtables), private=self.private)
@@ -166,9 +167,10 @@ class Namespace(ast.NodeVisitor):
         name = self.mangle(name)
         sym = self.table.lookup(name)
         if self.table.get_type() == 'module' or (sym.is_global() and self.table.is_optimized()) or name == 'None':
-            return T('{}').format(name)
+            return T('{__print}') if name == 'print' else T('{}').format(name)
         elif sym.is_global():
-            return T('({__l}[{!r}] if {!r} in __l else {})').format(name, name, name)
+            return T('({__l}[{!r}] if {!r} in __l else {})').format(
+                name, name, T('{__print}') if name == 'print' else name)
         elif sym.is_local():
             return T('{__l}[{!r}]').format(name)
         elif sym.is_free():
@@ -244,12 +246,9 @@ class Namespace(ast.NodeVisitor):
                               self.visit(target.value),
                               self.visit(target.slice))]
             else:
-                return [T("(lambda o: object.__getattribute__("
-                          "object.__getattribute__(type(o), '__dict__')"
-                          "['__delitem__'], '__get__')(o, type(o)))"
-                          "({})({})").format(
-                              self.visit(target.value),
-                              self.slice_repr(target.slice))]
+                return [T("{__operator}.delitem({}, {})").format(
+                    self.visit(target.value),
+                    self.slice_repr(target.slice))]
         elif type(target) is ast.Name:
             return [self.delete_var(target.id)]
         elif type(target) in (ast.List, ast.Tuple):
@@ -302,19 +301,15 @@ class Namespace(ast.NodeVisitor):
         else:
             raise SyntaxError('illegal expression for augmented assignment')
 
-        op = operator_code[type(tree.op)]
         iop = type(tree.op).__name__.lower()
         if iop.startswith('bit'):
             iop = iop[len('bit'):]
-        iop = '__i%s__' % iop
+        if 'division' in self.futures and isinstance(tree.op, ast.Div):
+            iop = 'truediv'
         value = self.visit(tree.value)
         assign = assignment_component(
             T('{after}'), target_value,
-            T("(lambda o, v: (lambda r: o {} v if r is NotImplemented else r)("
-              "object.__getattribute__(object.__getattribute__(type(o), "
-              "'__dict__').get({!r}, lambda self, other: NotImplemented), "
-              "'__get__')(o, type(o))(v)))({}, {})").format(
-                  op, iop, target_value, value))
+            T("{__operator}.i{}({}, {})").format(iop, target_value, value))
         if target_params:
             assign = T('(lambda {}: {})({})').format(
                 T(', ').join(target_params),
@@ -323,6 +318,8 @@ class Namespace(ast.NodeVisitor):
         return assign
 
     def visit_BinOp(self, tree):
+        if 'division' in self.futures and isinstance(tree.op, ast.Div):
+            return T('{__operator}.truediv({}, {})').format(self.visit(tree.left), self.visit(tree.right))
         return T('({} {} {})').format(self.visit(tree.left), operator_code[type(tree.op)], self.visit(tree.right))
 
     def visit_BoolOp(self, tree):
@@ -550,25 +547,54 @@ class Namespace(ast.NodeVisitor):
 
     def visit_Import(self, tree):
         after = T('{after}')
+        level_arg = ', level=0' if 'absolute_import' in self.futures else ''
         for alias in tree.names:
             ids = alias.name.split('.')
             if alias.asname is None:
                 after = assignment_component(after, self.store_var(ids[0]),
-                    T('__import__({!r}, {__g}, {__l})').format(alias.name))
+                    T('__import__({!r}, {__g}, {__l}{})').format(
+                        alias.name, level_arg))
             else:
                 after = assignment_component(after, self.store_var(alias.asname),
-                    T('.').join([T('__import__({!r}, {__g}, {__l})').format(
-                        alias.name)] + ids[1:]))
+                    T('.').join([T('__import__({!r}, {__g}, {__l}{})').format(
+                        alias.name, level_arg)] + ids[1:]))
         return after
 
     def visit_ImportFrom(self, tree):
+        body = assignment_component(
+            T('{after}'),
+            T(', ').join(self.store_var(alias.name if alias.asname is None
+                                        else alias.asname) for alias in tree.names),
+            T(', ').join('__mod.' + alias.name for alias in tree.names))
+        if tree.module == '__future__':
+            self.futures |= set(alias.name for alias in tree.names)
+            body = T(
+                '(lambda __f: type(__f)(type(__f.func_code)('
+                '__f.func_code.co_argcount, '
+                '__f.func_code.co_nlocals, '
+                '__f.func_code.co_stacksize, '
+                '__f.func_code.co_flags{}, '
+                '__f.func_code.co_code, '
+                '__f.func_code.co_consts, '
+                '__f.func_code.co_names, '
+                '__f.func_code.co_varnames, '
+                '__f.func_code.co_filename, '
+                '__f.func_code.co_name, '
+                '__f.func_code.co_firstlineno, '
+                '__f.func_code.co_lnotab, '
+                '__f.func_code.co_freevars, '
+                '__f.func_code.co_cellvars), '
+                '__f.func_globals, '
+                '__f.func_name, '
+                '__f.func_defaults, '
+                '__f.func_closure)())(lambda: {})'
+            ).format(
+                ''.join(' | __mod.' + alias.name + '.compiler_flag'
+                        for alias in tree.names),
+                body)
         return T('(lambda __mod: {})(__import__({!r}, {__g}, {__l},'
                  ' {!r}, {!r}))').format(
-            assignment_component(
-                T('{after}'),
-                T(', ').join(self.store_var(alias.name if alias.asname is None
-                                            else alias.asname) for alias in tree.names),
-                T(', ').join('__mod.' + alias.name for alias in tree.names)),
+            body,
             '' if tree.module is None else tree.module,
             tuple(alias.name for alias in tree.names),
             tree.level)
@@ -759,7 +785,7 @@ class Namespace(ast.NodeVisitor):
 
 
 # The entry point for everything.
-def to_one_line(original):
+def onelinerize(original):
     # original :: string
     # :: string
     t = ast.parse(original)
@@ -776,63 +802,3 @@ def to_one_line(original):
         return original
 
     return get_init_code(t, table)
-
-
-if __name__ == '__main__':
-    usage = ['python main.py --help',
-             'python main.py [--debug] [infile.py [outfile.py]]',
-            ]
-    parser = argparse.ArgumentParser(usage='\n       '.join(usage),
-        description=("if infile is given and outfile is not, outfile will be "
-                     "infile_ol.py"))
-    parser.add_argument('infile', nargs='?')
-    parser.add_argument('outfile', nargs='?')
-    parser.add_argument('--debug', action='store_true')
-    args = parser.parse_args()
-    original = None
-    if args.infile is None:
-        # I have gotten no arguments. Look at sys.stdin
-        original = sys.stdin.read()
-        outfilename = None
-    elif args.outfile is None:
-        # I have gotten one argument. If there's something to read from
-        # sys.stdin, read from there.
-        if args.infile.endswith('.py'):
-            outfilename = '_ol.py'.join(args.infile.rsplit(".py", 1))
-        else:
-            outfilename = args.infile + '_ol.py'
-    else:
-        outfilename = args.outfile
-
-    if original is None:
-        infile = open(args.infile)
-        original = infile.read().strip()
-        infile.close()
-    onelined = to_one_line(original)
-    if outfilename is None:
-        print onelined
-    else:
-        outfi = open(outfilename, 'w')
-        outfi.write(onelined + '\n')
-        outfi.close()
-
-    if args.debug:
-        if outfilename is None:
-            # redirect to sys.stderr if I'm writing outfile to sys.stdout
-            sys.stdout = sys.stderr
-        print '--- ORIGINAL ---------------------------------'
-        print original
-        print '----------------------------------------------'
-        scope = {}
-        try:
-            exec(original, scope)
-        except Exception as e:
-            traceback.print_exc(e)
-        print '--- ONELINED ---------------------------------'
-        print onelined
-        print '----------------------------------------------'
-        scope = {}
-        try:
-            exec(onelined, scope)
-        except Exception as e:
-            traceback.print_exc(e)
